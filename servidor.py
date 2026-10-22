@@ -1,3 +1,4 @@
+
 import socket
 import threading
 import logging
@@ -9,177 +10,231 @@ logging.basicConfig(
 )
 
 
-class MessageHandler(ABC):
-
+class FormateadorMensaje(ABC):
     @abstractmethod
-    def handle(self, alias: str, message: str) -> str:
+    def formatear(self, alias: str, mensaje: str) -> str:
         pass
 
 
-class ChatMessageHandler(MessageHandler):
+class FormateadorChat(FormateadorMensaje):
+    def formatear(self, alias: str, mensaje: str) -> str:
+        return f"[{alias}]: {mensaje}"
 
-    def handle(self, alias: str, message: str) -> str:
-        return f"{alias}: {message}"
 
-
-class ClientManager:
-
+class GestorClientes:
     def __init__(self):
-        self._clients = {}
-        self._lock = threading.Lock()
+        self._clientes = {}
+        self._bloqueo = threading.Lock()
 
-    def add_client(self, client_socket, alias):
-        with self._lock:
-            self._clients[client_socket] = alias
+    def agregar(self, conexion, alias, direccion):
+        with self._bloqueo:
+            self._clientes[conexion] = {
+                "alias": alias,
+                "direccion": direccion,
+                "bloqueo_envio": threading.Lock()
+            }
 
-    def remove_client(self, client_socket):
-        with self._lock:
-            self._clients.pop(client_socket, None)
+    def eliminar(self, conexion):
+        with self._bloqueo:
+            return self._clientes.pop(conexion, None)
 
-    def broadcast(self, message, sender=None):
-        with self._lock:
-            clients = list(self._clients.keys())
+    def difundir(self, mensaje, remitente=None):
+        with self._bloqueo:
+            clientes = list(self._clientes.items())
 
-        for client in clients:
-            if client != sender:
-                try:
-                    client.sendall((message + "\n").encode("utf-8"))
-                except OSError:
-                    logging.warning("Error al enviar mensaje")
+        for conexion, datos in clientes:
+            if conexion == remitente:
+                continue
 
+            try:
+                with datos["bloqueo_envio"]:
+                    conexion.sendall(
+                        (mensaje + "\n").encode("utf-8")
+                    )
+            except OSError:
+                logging.warning(
+                    "Error al enviar a %s:%s",
+                    *datos["direccion"]
+                )
+                self.desconectar(conexion)
 
-class ClientHandler:
+    def desconectar(self, conexion):
+        datos = self.eliminar(conexion)
 
-    def __init__(self, client_socket, address, message_handler, client_manager):
-        self._client_socket = client_socket
-        self._address = address
-        self._message_handler = message_handler
-        self._client_manager = client_manager
-
-    def process(self):
-        alias = None
+        if datos is None:
+            return
 
         try:
-            with self._client_socket:
-                reader = self._client_socket.makefile(
-                    "r", encoding="utf-8"
-                )
+            conexion.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
-                alias = reader.readline().strip()
+        conexion.close()
 
-                if not alias:
-                    return
-
-                self._client_manager.add_client(
-                    self._client_socket, alias
-                )
-
-                logging.info(
-                    f"Cliente conectado: {alias} | "
-                    f"IP: {self._address[0]} | "
-                    f"Puerto: {self._address[1]}"
-                )
-
-                self._client_manager.broadcast(
-                    f"{alias} se ha conectado al chat",
-                    self._client_socket
-                )
-
-                while True:
-                    message = reader.readline()
-
-                    if not message:
-                        break
-
-                    message = message.strip()
-
-                    if not message:
-                        continue
-
-                    formatted_message = self._message_handler.handle(
-                        alias, message
-                    )
-
-                    logging.info(formatted_message)
-
-                    self._client_manager.broadcast(
-                        formatted_message,
-                        self._client_socket
-                    )
-
-        except (OSError, UnicodeError) as error:
-            logging.error(f"Error con {self._address}: {error}")
-
-        finally:
-            self._client_manager.remove_client(
-                self._client_socket
-            )
-
-            if alias:
-                logging.info(f"Cliente desconectado: {alias}")
-
-                self._client_manager.broadcast(
-                    f"{alias} se ha desconectado del chat"
-                )
-
-
-class ThreadedSocketServer:
-
-    def __init__(self, host, port, message_handler):
-        self._host = host
-        self._port = port
-        self._message_handler = message_handler
-        self._client_manager = ClientManager()
-
-        self._server_socket = socket.socket(
-            socket.AF_INET, socket.SOCK_STREAM
-        )
-
-        self._server_socket.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_REUSEADDR,
-            1
-        )
-
-    def start(self):
-        self._server_socket.bind((self._host, self._port))
-        self._server_socket.listen()
+        ip, puerto = datos["direccion"]
 
         logging.info(
-            f"Servidor iniciado en {self._host}:{self._port}"
+            "Cliente desconectado: %s | IP: %s | Puerto: %s",
+            datos["alias"], ip, puerto
         )
-        logging.info("Esperando conexiones...")
 
+        self.difundir(
+            f"{datos['alias']} se ha desconectado del chat"
+        )
+
+    def cerrar_todos(self):
+        with self._bloqueo:
+            conexiones = list(self._clientes.keys())
+
+        for conexion in conexiones:
+            self.desconectar(conexion)
+
+
+class ManejadorCliente:
+    def __init__(
+        self, conexion, direccion, formateador, gestor
+    ):
+        self._conexion = conexion
+        self._direccion = direccion
+        self._formateador = formateador
+        self._gestor = gestor
+
+    def procesar(self):
         try:
-            while True:
-                client_socket, address = self._server_socket.accept()
+            with self._conexion:
+                with self._conexion.makefile(
+                    "r", encoding="utf-8"
+                ) as lector:
 
-                handler = ClientHandler(
-                    client_socket,
-                    address,
-                    self._message_handler,
-                    self._client_manager
-                )
+                    alias = lector.readline().strip()
 
-                thread = threading.Thread(
-                    target=handler.process,
-                    daemon=True
-                )
+                    if not alias:
+                        return
 
-                thread.start()
+                    alias = alias[:30]
 
-        except KeyboardInterrupt:
-            logging.info("Servidor detenido por el usuario")
+                    self._gestor.agregar(
+                        self._conexion,
+                        alias,
+                        self._direccion
+                    )
+
+                    ip, puerto = self._direccion
+
+                    logging.info(
+                        "Cliente conectado: %s | IP: %s | Puerto: %s",
+                        alias, ip, puerto
+                    )
+
+                    self._gestor.difundir(
+                        f"{alias} se ha conectado al chat",
+                        self._conexion
+                    )
+
+                    while True:
+                        mensaje = lector.readline()
+
+                        if not mensaje:
+                            break
+
+                        mensaje = mensaje.strip()
+
+                        if not mensaje:
+                            continue
+
+                        texto = self._formateador.formatear(
+                            alias, mensaje
+                        )
+
+                        logging.info(texto)
+
+                        self._gestor.difundir(
+                            texto,
+                            self._conexion
+                        )
+
+        except (OSError, UnicodeError) as error:
+            logging.warning(
+                "Error con %s:%s: %s",
+                *self._direccion, error
+            )
 
         finally:
-            self._server_socket.close()
+            self._gestor.desconectar(self._conexion)
+
+
+class ServidorChat:
+    def __init__(self, direccion_ip, puerto, formateador):
+        self._direccion_ip = direccion_ip
+        self._puerto = puerto
+        self._formateador = formateador
+        self._gestor = GestorClientes()
+
+    def iniciar(self):
+        with socket.socket(
+            socket.AF_INET, socket.SOCK_STREAM
+        ) as servidor:
+
+            servidor.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_REUSEADDR,
+                1
+            )
+
+            servidor.bind(
+                (self._direccion_ip, self._puerto)
+            )
+
+            servidor.listen()
+
+            logging.info(
+                "Servidor iniciado en %s:%s",
+                self._direccion_ip, self._puerto
+            )
+
+            logging.info("Esperando conexiones...")
+
+            try:
+                while True:
+                    conexion, direccion = servidor.accept()
+
+                    manejador = ManejadorCliente(
+                        conexion,
+                        direccion,
+                        self._formateador,
+                        self._gestor
+                    )
+
+                    hilo = threading.Thread(
+                        target=manejador.procesar,
+                        daemon=True
+                    )
+
+                    hilo.start()
+
+            except KeyboardInterrupt:
+                logging.info(
+                    "Servidor detenido por el usuario"
+                )
+
+            except OSError as error:
+                logging.error(
+                    "Error del servidor: %s", error
+                )
+
+            finally:
+                self._gestor.cerrar_todos()
+                logging.info("Servidor finalizado")
 
 
 if __name__ == "__main__":
-    HOST = "0.0.0.0"
-    PORT = 65432
+    DIRECCION_IP = "0.0.0.0"
+    PUERTO = 65432
 
-    handler = ChatMessageHandler()
-    server = ThreadedSocketServer(HOST, PORT, handler)
+    servidor = ServidorChat(
+        DIRECCION_IP,
+        PUERTO,
+        FormateadorChat()
+    )
 
-    server.start()
+    servidor.iniciar()
