@@ -1,3 +1,4 @@
+
 import socket
 import threading
 import logging
@@ -8,132 +9,143 @@ logging.basicConfig(
 )
 
 
-class SocketClient:
+class ClienteChat:
+    def __init__(self, direccion_ip: str, puerto: int):
+        self._direccion_ip = direccion_ip
+        self._puerto = puerto
 
-    def __init__(self, host: str, port: int):
-
-        self._host = host
-        self._port = port
-
-        self._socket = socket.socket(
+        self._conexion = socket.socket(
             socket.AF_INET,
             socket.SOCK_STREAM
         )
 
-        self._connected = False
+        self._conectado = threading.Event()
 
-    def connect(self, alias: str):
-
-        self._socket.connect(
-            (self._host, self._port)
+    def conectar(self, alias: str):
+        self._conexion.connect(
+            (self._direccion_ip, self._puerto)
         )
 
-        self._connected = True
-
-        self._socket.sendall(
+        self._conexion.sendall(
             (alias + "\n").encode("utf-8")
         )
 
+        self._conectado.set()
+
         logging.info(
-            f"Conectado al servidor como {alias}"
+            "Conectado al servidor como %s",
+            alias
         )
 
-        thread = threading.Thread(
-            target=self.receive_messages,
+        hilo = threading.Thread(
+            target=self.recibir_mensajes,
             daemon=True
         )
 
-        thread.start()
+        hilo.start()
 
-    def receive_messages(self):
-
+    def recibir_mensajes(self):
         try:
-            reader = self._socket.makefile(
-                "r",
-                encoding="utf-8"
-            )
+            with self._conexion.makefile(
+                "r", encoding="utf-8"
+            ) as lector:
 
-            while self._connected:
+                while self._conectado.is_set():
+                    mensaje = lector.readline()
 
-                message = reader.readline()
+                    if not mensaje:
+                        print(
+                            "\nEl servidor cerró la conexión."
+                        )
+                        break
 
-                if not message:
-                    break
-
-                print(f"\n{message.strip()}")
+                    print(
+                        f"\n{mensaje.strip()}",
+                        flush=True
+                    )
 
         except (OSError, UnicodeError) as error:
-            if self._connected:
-                logging.error(
-                    f"Error al recibir mensajes: {error}"
+            if self._conectado.is_set():
+                logging.warning(
+                    "Error al recibir mensajes: %s",
+                    error
                 )
 
         finally:
-            self._connected = False
+            self._conectado.clear()
 
-    def send_messages(self):
-
+    def enviar_mensajes(self):
         try:
-            while self._connected:
+            while self._conectado.is_set():
+                mensaje = input()
 
-                message = input()
-
-                if message.lower() == "/salir":
+                if not self._conectado.is_set():
                     break
 
-                if message.strip():
+                if mensaje.strip().lower() == "/salir":
+                    break
 
-                    self._socket.sendall(
-                        (message + "\n").encode("utf-8")
+                if mensaje.strip():
+                    self._conexion.sendall(
+                        (mensaje + "\n").encode("utf-8")
                     )
 
         except (OSError, EOFError, KeyboardInterrupt):
             logging.info("Finalizando cliente")
 
         finally:
-            self.disconnect()
+            self.desconectar()
 
-    def disconnect(self):
-
-        self._connected = False
+    def desconectar(self):
+        self._conectado.clear()
 
         try:
-            self._socket.shutdown(
+            self._conexion.shutdown(
                 socket.SHUT_RDWR
             )
         except OSError:
             pass
 
-        self._socket.close()
+        self._conexion.close()
 
-        logging.info("Desconectado del servidor")
+        logging.info("Cliente desconectado")
 
 
 if __name__ == "__main__":
+    PUERTO = 65432
 
-    HOST = "172.17.44.239"
-    PORT = 65432
+    direccion_ip = input(
+        "Ingrese la IP del servidor: "
+    ).strip()
 
-    alias = input("Ingrese su alias: ").strip()
+    alias = input(
+        "Ingrese su alias: "
+    ).strip()
 
-    if not alias:
-        print("El alias no puede estar vacío")
+    if not direccion_ip or not alias:
+        print(
+            "La IP y el alias son obligatorios."
+        )
     else:
-        client = SocketClient(
-            HOST,
-            PORT
+        cliente = ClienteChat(
+            direccion_ip,
+            PUERTO
         )
 
         try:
-            client.connect(alias)
+            cliente.conectar(alias)
 
-            print("Escriba sus mensajes")
-            print("Escriba /salir para desconectarse")
+            print("Escriba sus mensajes.")
+            print(
+                "Escriba /salir para desconectarse."
+            )
 
-            client.send_messages()
+            cliente.enviar_mensajes()
 
         except OSError as error:
             logging.error(
-                f"No se pudo establecer la conexión: {error}"
+                "No se pudo conectar: %s",
+                error
             )
-            client.disconnect()
+
+            cliente.desconectar()
